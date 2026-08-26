@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>TechService - Request & Tracker</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 </head>
 <body class="bg-slate-100 font-sans text-slate-800">
 
@@ -98,29 +99,64 @@
         // Target receiver email requested
         const RECEIVER_EMAIL = "markjosephfeliciano8@gmail.com";
 
-        // Initial Mock Data
-        let tickets = [
-            {
-                id: "REQ-1001",
-                name: "Alex Smith",
-                email: "alex@example.com",
-                service: "Hardware Diagnostics",
-                details: "Computer randomly shuts down under load.",
-                status: "In Progress",
-                workerAssigned: true,
-                progress: 50
-            },
-            {
-                id: "REQ-1002",
-                name: "Maria Garcia",
-                email: "maria@example.com",
-                service: "Wi-Fi Optimization",
-                details: "Dead zones in the back office area.",
-                status: "Pending",
-                workerAssigned: false,
-                progress: 0
+        // --- Supabase setup: replace these two with your own project's values ---
+        const SUPABASE_URL = "https://wjmqrizdvoyjehzevwqv.supabase.co";
+        const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndqbXFyaXpkdm95amVoemV2d3F2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODc3NTA3MzYsImV4cCI6MjEwMzMyNjczNn0.oP6KsS583GumO21crPR0U9uH5_I42RhTslaUtZDzIx0";
+        // ---------------------------------------------------------------------
+        const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+        // Tickets now start empty and are populated live from Supabase
+        let tickets = [];
+
+        // Convert a Supabase row (snake_case) into the shape the UI expects (camelCase)
+        function fromRow(row) {
+            return {
+                id: row.id,
+                name: row.name,
+                email: row.email,
+                service: row.service,
+                details: row.details,
+                status: row.status,
+                workerAssigned: row.worker_assigned,
+                progress: row.progress
+            };
+        }
+
+        // Add or update a ticket in the local array, then re-render
+        function upsertLocalTicket(row) {
+            const ticket = fromRow(row);
+            const idx = tickets.findIndex(t => t.id === ticket.id);
+            if (idx === -1) {
+                tickets.unshift(ticket);
+            } else {
+                tickets[idx] = ticket;
             }
-        ];
+            render();
+        }
+
+        // Load every existing ticket when the page opens
+        async function loadTickets() {
+            const { data, error } = await supabase
+                .from('tickets')
+                .select('*')
+                .order('created_at', { ascending: false });
+
+            if (error) {
+                console.error('Failed to load tickets:', error);
+                return;
+            }
+            tickets = data.map(fromRow);
+            render();
+        }
+
+        // Live-sync: whenever any visitor inserts or updates a ticket, everyone sees it
+        supabase
+            .channel('tickets-changes')
+            .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'tickets' },
+                (payload) => upsertLocalTicket(payload.new))
+            .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'tickets' },
+                (payload) => upsertLocalTicket(payload.new))
+            .subscribe();
 
         // Switch Views between Customer and Worker
         function switchView(view) {
@@ -173,21 +209,25 @@
                     throw new Error('Form submission responded with status ' + response.status);
                 }
 
-                const newTicket = {
+                // Save the ticket to Supabase so every visitor sees it live
+                const { error: dbError } = await supabase.from('tickets').insert({
                     id: ticketId,
                     name,
                     email,
                     service,
                     details,
                     status: "Pending",
-                    workerAssigned: false,
+                    worker_assigned: false,
                     progress: 0
-                };
+                });
 
-                tickets.unshift(newTicket);
+                if (dbError) {
+                    throw dbError;
+                }
+
                 form.reset();
-                alert(`Ticket ${newTicket.id} submitted successfully! A notification has been sent to ${RECEIVER_EMAIL}.`);
-                render();
+                alert(`Ticket ${ticketId} submitted successfully! A notification has been sent to ${RECEIVER_EMAIL}.`);
+                // No need to manually add it to the list — the realtime subscription above handles that
             } catch (err) {
                 console.error('Service request submission failed:', err);
                 alert('Your ticket could not be submitted right now. Please check your connection and try again, or contact us directly.');
@@ -198,28 +238,35 @@
         }
 
         // Accept job by worker
-        function acceptTicket(id) {
-            const ticket = tickets.find(t => t.id === id);
-            if (ticket) {
-                ticket.status = "In Progress";
-                ticket.workerAssigned = true;
-                ticket.progress = 25;
-                render();
+        async function acceptTicket(id) {
+            const { error } = await supabase
+                .from('tickets')
+                .update({ status: "In Progress", worker_assigned: true, progress: 25 })
+                .eq('id', id);
+
+            if (error) {
+                console.error('Failed to accept ticket:', error);
+                alert('Could not accept the ticket right now. Please try again.');
+                return;
             }
+            // The realtime subscription will update the list for everyone, including this tab
         }
 
         // Update progress by worker
-        function updateProgress(id, newProgress) {
-            const ticket = tickets.find(t => t.id === id);
-            if (ticket) {
-                ticket.progress = parseInt(newProgress);
-                if (ticket.progress === 100) {
-                    ticket.status = "Completed";
-                } else if (ticket.progress > 0) {
-                    ticket.status = "In Progress";
-                }
-                render();
+        async function updateProgress(id, newProgress) {
+            const progress = parseInt(newProgress);
+            const status = progress === 100 ? "Completed" : (progress > 0 ? "In Progress" : "Pending");
+
+            const { error } = await supabase
+                .from('tickets')
+                .update({ progress, status })
+                .eq('id', id);
+
+            if (error) {
+                console.error('Failed to update progress:', error);
+                alert('Could not update progress right now. Please try again.');
             }
+            // The realtime subscription will update the list for everyone, including this tab
         }
 
         // Render UI Elements
@@ -292,9 +339,10 @@
             }
         }
 
-        // Initial Render
+        // Initial Load
         document.getElementById('targetMailReceiver').textContent = RECEIVER_EMAIL;
-        render();
+        loadTickets();
     </script>
 </body>
-</html>
+                                                                                       </html>
+    
